@@ -45,7 +45,6 @@ async def websocket_endpoint(websocket: WebSocket):
             data = await websocket.receive_text()
             if data == "stop":
                 logger.info("Stop request received")
-                # Add stop logic here if CustomAgent supports it
     except WebSocketDisconnect:
         websockets.remove(websocket)
     except Exception as e:
@@ -59,7 +58,7 @@ async def broadcast(data: dict):
         except Exception:
             websockets.remove(ws)
 
-async def run_agent(task: str):
+async def run_agent(task: str, cdp_url: str = "http://localhost:9222"):
     browser = None
     browser_context = None
     try:
@@ -72,18 +71,39 @@ async def run_agent(task: str):
             google_api_key=google_api_key,
             temperature=0.7
         )
-        browser = CustomBrowser(
-            config=BrowserConfig(
-                headless=False,  # Keep visible for debugging
-                disable_security=True
+
+        # Try connecting to existing browser via CDP
+        try:
+            logger.info(f"Attempting to connect to browser via CDP at {cdp_url}")
+            browser = CustomBrowser(
+                config=BrowserConfig(
+                    headless=False,
+                    cdp_url=cdp_url,
+                    disable_security=True
+                )
             )
-        )
-        browser_context = await browser.new_context(
-            config=BrowserContextConfig(
-                no_viewport=False,
-                browser_window_size=BrowserContextWindowSize(width=1280, height=1100)
+            browser_context = await browser.new_context(
+                config=BrowserContextConfig(
+                    no_viewport=False,
+                    browser_window_size=BrowserContextWindowSize(width=1280, height=1100)
+                )
             )
-        )
+            logger.info("Successfully connected to existing browser via CDP")
+        except Exception as cdp_error:
+            logger.warning(f"CDP connection failed: {str(cdp_error)}. Falling back to launching a new browser.")
+            browser = CustomBrowser(
+                config=BrowserConfig(
+                    headless=False,  # Launch visible browser as fallback
+                    disable_security=True
+                )
+            )
+            browser_context = await browser.new_context(
+                config=BrowserContextConfig(
+                    no_viewport=False,
+                    browser_window_size=BrowserContextWindowSize(width=1280, height=1100)
+                )
+            )
+
         controller = CustomController()
         agent = CustomAgent(
             task=task,
@@ -93,7 +113,7 @@ async def run_agent(task: str):
             controller=controller,
             system_prompt_class=CustomSystemPrompt,
             agent_prompt_class=CustomAgentMessagePrompt,
-            max_actions_per_step=6  # Match the 6 actions in your log
+            max_actions_per_step=5
         )
 
         step_info = CustomAgentStepInfo(
@@ -111,11 +131,10 @@ async def run_agent(task: str):
                 else:
                     logger.warning(f"Screenshot type is {type(state.screenshot)}, expected bytes")
 
-            # Adjust this based on your CustomAgent implementation
             thought = ""
             actions = []
             if hasattr(agent.state, 'last_output') and agent.state.last_output:
-                thought = agent.state.last_output.current_state.thought
+                thought = agent.state.last_output.current_state.thought or ""
             if hasattr(agent.state, 'last_action') and agent.state.last_action:
                 actions = [action.model_dump(exclude_unset=True) for action in agent.state.last_action]
 
@@ -132,19 +151,23 @@ async def run_agent(task: str):
             if agent.state.history.is_done():
                 break
 
-        result = agent.state.history.history[-1].result[-1].extracted_content if agent.state.history.history else "Task failed"
-        await broadcast({"status": "done", "result": result})
-        return result
+        if agent.state.history.history:
+            last_result = agent.state.history.history[-1].result
+            final_result = last_result[-1].extracted_content if last_result and isinstance(last_result, list) else "Task completed but no content extracted"
+        else:
+            final_result = "Task failed: No history available"
+
+        await broadcast({"status": "done", "result": final_result})
+        return final_result
     except Exception as e:
         error_msg = f"Error: {str(e)}"
         logger.error(error_msg)
         await broadcast({"status": "error", "message": error_msg})
         return None
     finally:
-        # Only close if task is done or errored out
-        if 'browser_context' in locals() and browser_context:
+        if browser_context:
             await browser_context.close()
-        if 'browser' in locals() and browser:
+        if browser:
             await browser.close()
 
 @app.post("/run-task")
